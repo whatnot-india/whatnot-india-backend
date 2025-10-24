@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
 const Product = require("../models/Product");
+const Category = require("../models/Category");
 const { protect } = require("../middleware/authMiddleware");
 const { authorizeRoles } = require("../middleware/roleMiddleware");
 const { attachBusinessType } = require("../middleware/businessTypeMiddleware");
@@ -28,24 +29,44 @@ const upload = multer({ storage });
 const makeImageUrl = (req, filename) =>
   `${req.protocol}://${req.get("host")}/uploads/products/${filename}`;
 
+// ✅ Helper to normalize image URLs
+const normalizeImageUrls = (req, product) => {
+  const mapImg = (img) =>
+    img.startsWith("http")
+      ? img
+      : `${req.protocol}://${req.get("host")}/uploads/products/${path.basename(img)}`;
+
+  const images = product.images?.map(mapImg);
+  const variants = product.variants?.map((v) => ({
+    ...v,
+    images: v.images?.map(mapImg),
+  }));
+
+  return { ...product, images, variants };
+};
+
 // ------------------- CREATE PRODUCT -------------------
 router.post(
   "/",
   protect,
   authorizeRoles("Admin"),
-  upload.array("images", 5),
+  upload.array("images", 10),
   async (req, res) => {
     try {
       let data = { ...req.body };
 
-      // Parse prices if provided
-      if (data.prices) {
+      // Parse complex fields
+      const parseField = (field) => {
+        if (!data[field]) return undefined;
         try {
-          data.prices = typeof data.prices === "string" ? JSON.parse(data.prices) : data.prices;
-        } catch (e) {
-          return res.status(400).json({ message: "Invalid prices format" });
+          return typeof data[field] === "string" ? JSON.parse(data[field]) : data[field];
+        } catch {
+          throw new Error(`Invalid ${field} format`);
         }
-      }
+      };
+
+      data.prices = parseField("prices") || {};
+      data.variants = parseField("variants") || [];
 
       const product = new Product({
         ...data,
@@ -56,36 +77,58 @@ router.post(
       await product.save();
       res.status(201).json({ message: "Product created successfully", product });
     } catch (error) {
-      res.status(500).json({ message: error.message });
+      res.status(400).json({ message: error.message });
     }
   }
 );
 
-// ------------------- GET ALL PRODUCTS -------------------
+router.get("/categories/by-brand/:brandId", protect, async (req, res) => {
+  try {
+    const { brandId } = req.params;
+
+    // find all distinct categories used in products of that brand
+    const categoryIds = await Product.distinct("category", { brand: brandId });
+
+    // fetch category documents
+    const categories = await Category.find({ _id: { $in: categoryIds } });
+
+    res.json(categories);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
+// ------------------- GET ALL PRODUCTS (with filters) -------------------
 router.get("/", protect, attachBusinessType, async (req, res) => {
   try {
-    const products = await Product.find()
+    const { category, brand, search, isActive } = req.query;
+
+    const filter = {};
+    if (category) filter.category = category;
+    if (brand) filter.brand = brand;
+    if (isActive !== undefined) filter.isActive = isActive === "true";
+    if (search) filter.name = { $regex: search, $options: "i" };
+
+    const products = await Product.find(filter)
       .populate("brand", "name")
       .populate("category", "name")
       .sort({ createdAt: -1 })
       .lean();
 
     const formatted = products.map((p) => {
-      const images = p.images?.map((img) =>
-        img.startsWith("http")
-          ? img
-          : `${req.protocol}://${req.get("host")}/uploads/products/${path.basename(img)}`
-      );
+      const { images, variants } = normalizeImageUrls(req, p);
 
       if (req.user.role === "Customer" && req.businessType) {
         return {
           ...p,
           images,
-          price: p.prices[req.businessType],
+          variants,
+          price: p.prices?.[req.businessType],
           prices: undefined,
         };
       }
-      return { ...p, images };
+      return { ...p, images, variants };
     });
 
     res.json(formatted);
@@ -104,22 +147,19 @@ router.get("/:id", protect, attachBusinessType, async (req, res) => {
 
     if (!product) return res.status(404).json({ message: "Product not found" });
 
-    const images = product.images?.map((img) =>
-      img.startsWith("http")
-        ? img
-        : `${req.protocol}://${req.get("host")}/uploads/products/${path.basename(img)}`
-    );
+    const { images, variants } = normalizeImageUrls(req, product);
 
     if (req.user.role === "Customer" && req.businessType) {
       return res.json({
         ...product,
         images,
-        price: product.prices[req.businessType],
+        variants,
+        price: product.prices?.[req.businessType],
         prices: undefined,
       });
     }
 
-    res.json({ ...product, images });
+    res.json({ ...product, images, variants });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -130,7 +170,7 @@ router.put(
   "/:id",
   protect,
   authorizeRoles("Admin"),
-  upload.array("images", 5),
+  upload.array("images", 10),
   async (req, res) => {
     try {
       const product = await Product.findById(req.params.id);
@@ -138,17 +178,20 @@ router.put(
 
       let updates = { ...req.body };
 
-      // Parse prices
-      if (updates.prices) {
+      // Parse JSON fields safely
+      const safeParse = (field) => {
+        if (!updates[field]) return undefined;
         try {
-          updates.prices =
-            typeof updates.prices === "string" ? JSON.parse(updates.prices) : updates.prices;
-        } catch (e) {
-          return res.status(400).json({ message: "Invalid prices format" });
+          return typeof updates[field] === "string" ? JSON.parse(updates[field]) : updates[field];
+        } catch {
+          throw new Error(`Invalid ${field} format`);
         }
-      }
+      };
 
-      // Add new images
+      updates.prices = safeParse("prices") || product.prices;
+      updates.variants = safeParse("variants") || product.variants;
+
+      // Handle image additions
       if (req.files && req.files.length > 0) {
         updates.images = [
           ...(product.images || []),
@@ -156,7 +199,7 @@ router.put(
         ];
       }
 
-      // Handle removeImages
+      // Handle image removals
       if (updates.removeImages) {
         let removeList = [];
         try {
@@ -164,8 +207,8 @@ router.put(
             typeof updates.removeImages === "string"
               ? JSON.parse(updates.removeImages)
               : updates.removeImages;
-        } catch (e) {
-          return res.status(400).json({ message: "Invalid removeImages format" });
+        } catch {
+          throw new Error("Invalid removeImages format");
         }
 
         product.images.forEach((img) => {
@@ -178,14 +221,12 @@ router.put(
         updates.images = product.images.filter((img) => !removeList.includes(img));
       }
 
-      // Merge and save
       Object.assign(product, updates);
       await product.save();
 
       res.json({ message: "Product updated successfully", product });
     } catch (error) {
-      console.error("Update error:", error);
-      res.status(500).json({ message: error.message });
+      res.status(400).json({ message: error.message });
     }
   }
 );
@@ -196,7 +237,13 @@ router.delete("/:id", protect, authorizeRoles("Admin"), async (req, res) => {
     const product = await Product.findById(req.params.id);
     if (!product) return res.status(404).json({ message: "Product not found" });
 
-    product.images.forEach((img) => {
+    // Delete product and variant images
+    const allImages = [
+      ...(product.images || []),
+      ...(product.variants || []).flatMap((v) => v.images || []),
+    ];
+
+    allImages.forEach((img) => {
       const imgPath = path.join(__dirname, "..", "uploads", "products", path.basename(img));
       if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
     });

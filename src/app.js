@@ -5,27 +5,31 @@ const path = require("path");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
+const mime = require("mime-types");
 const Message = require("./models/Chat");
-const mime = require("mime-types"); // ✅ correct package
 
 const app = express();
 app.use(express.json());
 
-// ✅ Allow frontend requests
+// ✅ CORS
 app.use(
   cors({
-    origin: ["http://localhost:5173", "http://localhost:3000"], // React & Flutter Dev
+    origin: [
+      "http://localhost:5173",
+      "http://localhost:3000",
+      "http://192.168.40.161:5173",
+    ],
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true,
-    exposedHeaders: ["Content-Disposition"], // allow file headers
+    exposedHeaders: ["Content-Disposition"],
   })
 );
 
-// ✅ Serve uploaded KYC files with correct MIME type
+// ✅ Serve uploads with MIME type
 app.use(
   "/uploads",
   (req, res, next) => {
-    const type = mime.lookup(req.path); // ✅ works with mime-types
+    const type = mime.lookup(req.path);
     if (type) res.type(type);
     next();
   },
@@ -42,58 +46,101 @@ app.use("/api/billing", require("./routes/billingRoutes"));
 app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/kyc", require("./routes/kycRoutes"));
 app.use("/api/banners", require("./routes/bannerRoutes"));
-app.use("/api/chat", require("./routes/chatRoutes")); // ✅ Chat Routes
+app.use("/api/chat", require("./routes/chatRoutes"));
 app.use("/api/brands", require("./routes/brandRoutes"));
 app.use("/api/categories", require("./routes/categoryRoutes"));
 app.use("/api/products", require("./routes/productRoutes"));
+app.use("/api/orders", require("./routes/orderRoutes"));
+app.use("/api/ledgers", require("./routes/ledgerRoutes"));
 
+app.get("/", (req, res) => res.send("✅ API is running..."));
 
-app.get("/", (req, res) => res.send("API is running..."));
-
-// ✅ Create server for sockets
+// ✅ HTTP Server
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: [
       "http://localhost:5173",
       "http://localhost:3000",
-      "http://192.168.40.161:5173", // ✅ LAN React app
+      "http://192.168.40.161:5173",
     ],
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
 
-// ✅ Socket.IO Chat Events
+// 🧠 Track active users
+const activeUsers = new Map();
+
 io.on("connection", (socket) => {
-  console.log("⚡ A user connected:", socket.id);
+  console.log(`⚡ User connected: ${socket.id}`);
 
   socket.on("join", (userId) => {
-    socket.join(userId); // Each user joins their private room
-    console.log(`✅ User ${userId} joined room`);
+    if (userId) {
+      activeUsers.set(userId, socket.id);
+      socket.join(userId);
+      console.log(`✅ User ${userId} joined their room`);
+      io.emit("active_users", Array.from(activeUsers.keys()));
+    }
   });
 
+  // 📩 Send message
   socket.on("send_message", async (data) => {
     try {
       const { sender, receiver, senderModel, receiverModel, message } = data;
+      if (!sender || !receiver || !message) return;
 
-      const newMessage = new Message({
+      const newMessage = await Message.create({
         sender,
         receiver,
         senderModel,
         receiverModel,
         message,
       });
-      await newMessage.save();
 
-      io.to(receiver).emit("receive_message", newMessage);
-    } catch (error) {
-      console.error("Message error:", error);
+      // 👉 send to receiver if online
+      const receiverSocket = activeUsers.get(receiver);
+      if (receiverSocket) io.to(receiverSocket).emit("receive_message", newMessage);
+
+      // 👉 send to sender to confirm
+      io.to(socket.id).emit("message_sent", newMessage);
+    } catch (err) {
+      console.error("❌ Message error:", err);
     }
   });
 
+  // 👀 Mark messages as read
+  socket.on("mark_read", async (data) => {
+    try {
+      const { userId, otherUserId } = data;
+      await Message.updateMany(
+        { sender: otherUserId, receiver: userId, read: false },
+        { $set: { read: true } }
+      );
+
+      // notify sender of read receipts
+      const senderSocket = activeUsers.get(otherUserId);
+      if (senderSocket) {
+        io.to(senderSocket).emit("messages_read", {
+          readerId: userId,
+          senderId: otherUserId,
+        });
+      }
+    } catch (err) {
+      console.error("❌ Mark read error:", err);
+    }
+  });
+
+  // ❌ Disconnect
   socket.on("disconnect", () => {
-    console.log("❌ User disconnected:", socket.id);
+    for (const [userId, socketId] of activeUsers.entries()) {
+      if (socketId === socket.id) {
+        activeUsers.delete(userId);
+        console.log(`❌ User ${userId} disconnected`);
+        io.emit("active_users", Array.from(activeUsers.keys()));
+        break;
+      }
+    }
   });
 });
 

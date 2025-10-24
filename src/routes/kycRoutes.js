@@ -6,7 +6,7 @@ const { protect } = require("../middleware/authMiddleware");
 const { authorizeRoles } = require("../middleware/roleMiddleware");
 const Kyc = require("../models/Kyc");
 const { businessTypes } = require("../models/Kyc");
-const Customer = require("../models/Customer"); // ✅ FIX ADDED
+const Customer = require("../models/Customer");
 
 const router = express.Router();
 
@@ -24,27 +24,26 @@ const storage = multer.diskStorage({
     cb(null, uploadPath);
   },
   filename: function (req, file, cb) {
-    cb(null, file.originalname);
+    cb(null, Date.now() + "-" + file.originalname); // keep original name, avoid collisions
   },
 });
 
-const upload = multer({ storage });
+// ------------------- FILE FILTER (PDF ONLY) -------------------
+function fileFilter(req, file, cb) {
+  if (file.mimetype !== "application/pdf") {
+    return cb(new Error("Only PDF files are allowed"), false);
+  }
+  cb(null, true);
+}
+
+const upload = multer({ storage, fileFilter });
 
 // ------------------- CUSTOMER UPLOAD -------------------
 router.post(
   "/upload",
   protect,
   authorizeRoles("Customer"),
-  upload.fields([
-    { name: "PAN" },
-    { name: "GST" },
-    { name: "CANCELLED_CHEQUE" },
-    { name: "MOA" },
-    { name: "AOA" },
-    { name: "COI" },
-    { name: "PARTNERSHIP_DEED" },
-    { name: "KYC" },
-  ]),
+  upload.any(), // allow dynamic fields
   async (req, res) => {
     const { businessType } = req.body;
 
@@ -53,47 +52,116 @@ router.post(
         return res.status(400).json({ message: "Invalid business type" });
       }
 
-      const requiredDocs = businessTypes[businessType];
-      const uploadedDocs = {};
-
-      requiredDocs.forEach((doc) => {
-        if (req.files[doc]) {
-          uploadedDocs[doc] = `/uploads/kycs/${req.user._id}/${req.files[doc][0].originalname}`;
-        }
-      });
-
-      const missingDocs = requiredDocs.filter((doc) => !uploadedDocs[doc]);
-      if (missingDocs.length > 0) {
-        return res.status(400).json({
-          message: "Missing required documents",
-          missing: missingDocs,
-        });
-      }
-
       let kyc = await Kyc.findOne({ customer: req.user._id });
-
       if (kyc && kyc.status === "APPROVED") {
         return res
           .status(400)
           .json({ message: "KYC already approved, cannot reupload" });
       }
 
-      if (!kyc) {
-        kyc = new Kyc({
-          customer: req.user._id,
-          businessType,
-          documents: uploadedDocs,
-          status: "PENDING",
+      // ------------------- CASE 1: PARTNERSHIP -------------------
+      if (businessType === "PARTNERSHIP") {
+        let partnersData = [];
+        const partners = JSON.parse(req.body.partners || "[]"); 
+
+        if (!partners.length) {
+          return res.status(400).json({ message: "Partners info required" });
+        }
+
+        partners.forEach((p, index) => {
+          const docs = {};
+          businessTypes.PARTNERSHIP.forEach((doc) => {
+            const fieldName = `${doc}_${index}`; // PAN_0, AADHAR_0 etc.
+            const file = req.files.find((f) => f.fieldname === fieldName);
+            if (file) {
+              docs[doc] = `/uploads/kycs/${req.user._id}/${file.filename}`;
+            }
+          });
+
+          const missingDocs = businessTypes.PARTNERSHIP.filter((d) => !docs[d]);
+          if (missingDocs.length > 0) {
+            throw new Error(
+              `Missing documents for partner ${p.name}: ${missingDocs.join(", ")}`
+            );
+          }
+
+          partnersData.push({
+            name: p.name,
+            documents: docs,
+          });
         });
-      } else {
-        kyc.businessType = businessType;
-        kyc.documents = uploadedDocs;
-        kyc.status = "PENDING";
-        kyc.rejectionReason = null;
+
+        if (!kyc) {
+          kyc = new Kyc({
+            customer: req.user._id,
+            businessType,
+            partners: partnersData,
+            status: "PENDING",
+          });
+        } else {
+          kyc.businessType = businessType;
+          kyc.partners = partnersData;
+          kyc.documents = undefined; // clear single docs
+          kyc.status = "PENDING";
+          kyc.rejectionReason = null;
+        }
+      } 
+      // ------------------- CASE 2: ALL OTHER TYPES -------------------
+      else {
+        const requiredDocs = businessTypes[businessType];
+        const uploadedDocs = {};
+
+        requiredDocs.forEach((doc) => {
+          const file = req.files.find((f) => f.fieldname === doc);
+          if (file) {
+            uploadedDocs[doc] = `/uploads/kycs/${req.user._id}/${file.filename}`;
+          }
+        });
+
+        const missingDocs = requiredDocs.filter((doc) => !uploadedDocs[doc]);
+        if (missingDocs.length > 0) {
+          return res.status(400).json({
+            message: "Missing required documents",
+            missing: missingDocs,
+          });
+        }
+
+        if (!kyc) {
+          kyc = new Kyc({
+            customer: req.user._id,
+            businessType,
+            documents: uploadedDocs,
+            status: "PENDING",
+          });
+        } else {
+          kyc.businessType = businessType;
+          kyc.documents = uploadedDocs;
+          kyc.partners = []; // clear partners
+          kyc.status = "PENDING";
+          kyc.rejectionReason = null;
+        }
       }
 
       await kyc.save();
       res.status(201).json({ message: "KYC uploaded successfully", kyc });
+    } catch (error) {
+      res.status(500).json({ message: error.message });
+    }
+  }
+);
+
+// ------------------- CUSTOMER: GET MY KYC -------------------
+router.get(
+  "/my-kyc",
+  protect,
+  authorizeRoles("Customer"),
+  async (req, res) => {
+    try {
+      const kyc = await Kyc.findOne({ customer: req.user._id });
+      if (!kyc) {
+        return res.json({ message: "No KYC uploaded yet" });
+      }
+      res.json(kyc);
     } catch (error) {
       res.status(500).json({ message: error.message });
     }
@@ -130,6 +198,7 @@ router.get(
           status: kyc ? kyc.status : "NOT_UPLOADED",
           rejectionReason: kyc ? kyc.rejectionReason : null,
           documents: kyc ? kyc.documents : null,
+          partners: kyc ? kyc.partners : null,
         };
       });
 

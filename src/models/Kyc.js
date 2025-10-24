@@ -1,10 +1,23 @@
 const mongoose = require("mongoose");
 
+// ✅ Now all business types use SAME required docs
 const businessTypes = {
-  PVT_LTD: ["PAN", "GST", "CANCELLED_CHEQUE", "MOA", "AOA", "COI"],
-  LLP: ["PAN", "GST", "CANCELLED_CHEQUE", "PARTNERSHIP_DEED"],
-  SOLE_PROPRIETORSHIP: ["PAN", "GST", "CANCELLED_CHEQUE", "KYC"],
+  PVT_LTD: ["PAN", "AADHAR", "GST", "CANCELLED_CHEQUE"],
+  LLP: ["PAN", "AADHAR", "GST", "CANCELLED_CHEQUE"],
+  SOLE_PROPRIETORSHIP: ["PAN", "AADHAR", "GST", "CANCELLED_CHEQUE"],
+  PARTNERSHIP: ["PAN", "AADHAR", "GST", "CANCELLED_CHEQUE"],
 };
+
+// Partner sub-schema
+const partnerSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  documents: {
+    PAN: String,
+    AADHAR: String,
+    GST: String,
+    CANCELLED_CHEQUE: String,
+  },
+});
 
 const kycSchema = new mongoose.Schema(
   {
@@ -14,10 +27,13 @@ const kycSchema = new mongoose.Schema(
       enum: Object.keys(businessTypes),
       required: true,
     },
+    // For normal business types
     documents: {
       type: Map,
-      of: String, // store file URL or path
+      of: String,
     },
+    // For partnership firm (multiple partners)
+    partners: [partnerSchema],
     status: {
       type: String,
       enum: ["PENDING", "APPROVED", "REJECTED"],

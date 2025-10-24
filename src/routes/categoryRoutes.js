@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
 const Category = require("../models/Category");
+const Product = require("../models/Product");
 const { protect } = require("../middleware/authMiddleware");
 const { authorizeRoles } = require("../middleware/roleMiddleware");
 
@@ -68,6 +69,27 @@ router.get("/:id", async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 });
+
+// ✅ Get categories by brand (NEW)
+router.get("/by-brand/:brandId", protect, async (req, res) => {
+  try {
+    const { brandId } = req.params;
+
+    // Find all products with that brand
+    const products = await Product.find({ brand: brandId }).select("category");
+
+    // Extract unique category IDs
+    const categoryIds = [...new Set(products.map((p) => p.category?.toString()))];
+
+    // Fetch category details
+    const categories = await Category.find({ _id: { $in: categoryIds } });
+
+    res.json(categories);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 
 // ------------------- UPDATE CATEGORY -------------------
 router.put(
